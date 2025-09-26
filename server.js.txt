@@ -1,0 +1,437 @@
+// server.js
+
+const express = require("express");
+
+const fetch = require("node-fetch");
+
+const UAParser = require("ua-parser-js");
+
+const helmet = require("helmet");
+
+const basicAuth = require("basic-auth");
+
+const Database = require("better-sqlite3");
+
+const { stringify } = require("csv-stringify/sync");
+
+const path = require("path");
+
+// Environment config (set these on your host)
+
+const PORT = process.env.PORT || 3000;
+
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+
+const ADMIN_PASS = process.env.ADMIN_PASS || "changeme";
+
+const IP_API_URL = process.env.IP_API_URL || "http://ip-api.com/json/"; // append IP
+
+const TRUSTED_ORIGINS = (process.env.TRUSTED_ORIGINS || "").split(",").filter(Boolean); // optional
+
+// Setup DB (file: data/visits.db)
+
+const dbPath = path.resolve(__dirname, "data");
+
+const fs = require("fs");
+
+if (!fs.existsSync(dbPath)) fs.mkdirSync(dbPath, { recursive: true });
+
+const db = new Database(path.join(dbPath, "visits.db"));
+
+db.prepare(`
+
+  CREATE TABLE IF NOT EXISTS visits (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    ts INTEGER NOT NULL,
+
+    ip TEXT,
+
+    country TEXT,
+
+    region TEXT,
+
+    city TEXT,
+
+    lat REAL,
+
+    lon REAL,
+
+    ua TEXT,
+
+    device_type TEXT,
+
+    os TEXT,
+
+    browser TEXT,
+
+    path TEXT,
+
+    referrer TEXT
+
+  )
+
+`).run();
+
+const insertStmt = db.prepare(`
+
+  INSERT INTO visits (ts, ip, country, region, city, lat, lon, ua, device_type, os, browser, path, referrer)
+
+  VALUES (@ts,@ip,@country,@region,@city,@lat,@lon,@ua,@device_type,@os,@browser,@path,@referrer)
+
+`);
+
+const app = express();
+
+app.use(helmet());
+
+app.use(express.json({ limit: "32kb" })); // small payloads only
+
+// Allow simple CORS from your site (optional: limit by TRUSTED_ORIGINS)
+
+app.use((req, res, next) => {
+
+  const origin = req.headers.origin;
+
+  if (!TRUSTED_ORIGINS.length || (origin && TRUSTED_ORIGINS.includes(origin))) {
+
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+
+    res.setHeader("Access-Control-Allow-Methods", "POST,GET,OPTIONS");
+
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  }
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+
+  next();
+
+});
+
+// Utility: get client IP (works behind proxies if provider sets X-Forwarded-For)
+
+function getClientIp(req) {
+
+  const xff = req.headers["x-forwarded-for"];
+
+  if (xff) {
+
+    return xff.split(",")[0].trim();
+
+  }
+
+  return req.connection.remoteAddress || req.socket.remoteAddress || req.ip;
+
+}
+
+// POST /track
+
+// Body can include { path, referrer } but none required.
+
+app.post("/track", async (req, res) => {
+
+  try {
+
+    // optional origin check
+
+    if (TRUSTED_ORIGINS.length) {
+
+      const origin = req.headers.origin || "";
+
+      if (!TRUSTED_ORIGINS.includes(origin)) {
+
+        // still allow but warn - you can make this strict by returning 403 instead
+
+        console.warn("Untrusted origin", origin);
+
+      }
+
+    }
+
+    const ip = getClientIp(req).replace("::ffff:", "");
+
+    const { path = "/", referrer = "" } = req.body || {};
+
+    // Parse UA
+
+    const ua = req.headers["user-agent"] || "";
+
+    const parser = new UAParser(ua);
+
+    const deviceType = parser.getDevice().type || "desktop";
+
+    const os = parser.getOS().name || "";
+
+    const browser = parser.getBrowser().name || "";
+
+    // Geo lookup with ip-api.com (free tier; rate-limited)
+
+    let geo = { country: null, region: null, city: null, lat: null, lon: null };
+
+    try {
+
+      const r = await fetch(`${IP_API_URL}${ip}?fields=status,country,regionName,city,lat,lon,message`);
+
+      const j = await r.json();
+
+      if (j && j.status === "success") {
+
+        geo.country = j.country || null;
+
+        geo.region = j.regionName || null;
+
+        geo.city = j.city || null;
+
+        geo.lat = j.lat || null;
+
+        geo.lon = j.lon || null;
+
+      } else {
+
+        // fallback: leave null
+
+      }
+
+    } catch (err) {
+
+      console.warn("geo lookup failed", err && err.message);
+
+    }
+
+    // insert
+
+    insertStmt.run({
+
+      ts: Date.now(),
+
+      ip,
+
+      country: geo.country,
+
+      region: geo.region,
+
+      city: geo.city,
+
+      lat: geo.lat,
+
+      lon: geo.lon,
+
+      ua,
+
+      device_type: deviceType,
+
+      os,
+
+      browser,
+
+      path,
+
+      referrer
+
+    });
+
+    return res.json({ ok: true });
+
+  } catch (err) {
+
+    console.error("track error", err);
+
+    return res.status(500).json({ error: "server error" });
+
+  }
+
+});
+
+// Basic auth helper
+
+function requireAdmin(req, res, next) {
+
+  const credentials = basicAuth(req) || {};
+
+  if (credentials.name === ADMIN_USER && credentials.pass === ADMIN_PASS) {
+
+    return next();
+
+  }
+
+  res.set("WWW-Authenticate", 'Basic realm="Admin"');
+
+  return res.status(401).send("Access denied");
+
+}
+
+// Admin page (HTML)
+
+app.get("/admin", requireAdmin, (req, res) => {
+
+  // Simple view: fetch last 300 rows
+
+  const rows = db.prepare(`SELECT * FROM visits ORDER BY ts DESC LIMIT 500`).all();
+
+  // render minimal HTML table
+
+  const tableRows = rows.map(r => `
+
+    <tr>
+
+      <td>${r.id}</td>
+
+      <td>${new Date(r.ts).toLocaleString()}</td>
+
+      <td>${r.ip || ""}</td>
+
+      <td>${escapeHtml(r.city || "")}</td>
+
+      <td>${escapeHtml(r.region || "")}</td>
+
+      <td>${escapeHtml(r.country || "")}</td>
+
+      <td>${escapeHtml(r.device_type || "")}</td>
+
+      <td>${escapeHtml(r.os || "")}</td>
+
+      <td>${escapeHtml(r.browser || "")}</td>
+
+      <td>${escapeHtml(r.path || "")}</td>
+
+      <td>${escapeHtml(r.referrer || "")}</td>
+
+    </tr>
+
+  `).join("\n");
+
+  res.send(`<!doctype html>
+
+  <html><head>
+
+    <meta charset="utf-8">
+
+    <title>Tracker Admin</title>
+
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+
+    <style>
+
+      body{font-family:Inter,Arial,Helvetica,sans-serif;padding:18px;background:#fafafa}
+
+      table{width:100%;border-collapse:collapse;font-size:13px}
+
+      th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}
+
+      th{background:#fff;position:sticky;top:0}
+
+      .topbar{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+
+      .btn{padding:8px 12px;border-radius:8px;background:#b21b61;color:#fff;text-decoration:none}
+
+      .small{font-size:12px;color:#666}
+
+      .wrap{overflow:auto;background:#fff;padding:10px;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,0.04)}
+
+    </style>
+
+  </head><body>
+
+    <div class="topbar">
+
+      <h2 style="margin:0">Visitor Tracker — Admin</h2>
+
+      <div style="flex:1"></div>
+
+      <a class="btn" href="/admin/export">Export CSV</a>
+
+    </div>
+
+    <div class="wrap">
+
+      <table>
+
+        <thead>
+
+          <tr>
+
+            <th>ID</th><th>Time</th><th>IP</th><th>City</th><th>Region</th><th>Country</th><th>Device</th><th>OS</th><th>Browser</th><th>Path</th><th>Referrer</th>
+
+          </tr>
+
+        </thead>
+
+        <tbody>
+
+          ${tableRows}
+
+        </tbody>
+
+      </table>
+
+    </div>
+
+    <p class="small">Note: Geo data from ip-api.com — accuracy depends on provider. Keep credentials safe.</p>
+
+  </body></html>`);
+
+});
+
+// Export CSV
+
+app.get("/admin/export", requireAdmin, (req, res) => {
+
+  const rows = db.prepare(`SELECT * FROM visits ORDER BY ts DESC`).all();
+
+  const csv = stringify(rows.map(r => ({
+
+    id: r.id,
+
+    ts: new Date(r.ts).toISOString(),
+
+    ip: r.ip,
+
+    city: r.city,
+
+    region: r.region,
+
+    country: r.country,
+
+    lat: r.lat,
+
+    lon: r.lon,
+
+    device_type: r.device_type,
+
+    os: r.os,
+
+    browser: r.browser,
+
+    path: r.path,
+
+    referrer: r.referrer
+
+  })), { header: true });
+
+  res.setHeader("Content-Type", "text/csv");
+
+  res.setHeader("Content-Disposition", "attachment; filename=visits.csv");
+
+  res.send(csv);
+
+});
+
+// Health route
+
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// helper
+
+function escapeHtml(s) {
+
+  return String(s || "").replace(/[&<>"']/g, (m) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));
+
+}
+
+app.listen(PORT, () => {
+
+  console.log(`Tracker listening on :${PORT}`);
+
+});
